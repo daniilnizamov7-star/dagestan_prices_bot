@@ -2,6 +2,7 @@ import os
 import sqlite3
 import asyncio
 import time
+from contextlib import contextmanager
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -17,6 +18,8 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 DB_FILE = "prices.db"
 
+MAX_LEN = {"product": 80, "store": 60, "address": 100}
+
 # --- БАЗА ДАННЫХ ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -26,9 +29,18 @@ def init_db():
         UNIQUE(product, store, address)
     )""")
     conn.commit()
-    return conn
+    conn.close()
 
-conn = init_db()
+@contextmanager
+def get_db():
+    """Открываем соединение на каждый запрос — безопасно для async."""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+init_db()
 
 # --- СЛОВАРИ ---
 user_states = {}
@@ -36,10 +48,8 @@ user_data = {}
 user_last_add = {}
 
 def reset_user(user_id):
-    if user_id in user_states:
-        del user_states[user_id]
-    if user_id in user_data:
-        del user_data[user_id]
+    user_states.pop(user_id, None)
+    user_data.pop(user_id, None)
 
 # --- КЛАВИАТУРЫ ---
 def main_menu():
@@ -51,9 +61,14 @@ def main_menu():
 
 def popular_products_kb():
     products = ["🥛 Молоко", "🍞 Хлеб", "🍗 Курица", "🥩 Говядина", "🍚 Рис", "🥚 Яйца", "🧈 Масло", "🍯 Финики"]
-    kb = [products[i:i+2] for i in range(0, len(products), 2)]
+    kb = [[KeyboardButton(text=p) for p in products[i:i+2]] for i in range(0, len(products), 2)]
     kb.append([KeyboardButton(text="⬅️ Назад в меню")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def cancel_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_add")]]
+    )
 
 # --- ХЕНДЛЕРЫ ---
 @dp.message(Command("start"))
@@ -103,23 +118,29 @@ async def start_add_price(m: types.Message):
         "• яйца 10шт\n\n"
         "Так поиск будет точнее! 👇",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_add")]])
+        reply_markup=cancel_kb()
     )
 
 @dp.callback_query(F.data == "cancel_add")
 async def cancel_add_cb(cq: types.CallbackQuery):
     reset_user(cq.from_user.id)
-    await cq.message.edit_text("❌ Отменено.", reply_markup=main_menu())
+    await cq.message.edit_text("❌ Добавление отменено.")
+    # Отдельным сообщением возвращаем reply-клавиатуру
+    await cq.message.answer("🏠 Главное меню", reply_markup=main_menu())
     await cq.answer()
 
 @dp.message(lambda msg: user_states.get(msg.from_user.id) == "WAIT_PRODUCT")
 async def get_product(m: types.Message):
-    user_data[m.from_user.id]["product"] = m.text.lower().strip()
+    text = m.text.strip()
+    if len(text) > MAX_LEN["product"]:
+        await m.answer(f"❌ Слишком длинное название (макс. {MAX_LEN['product']} символов). Сократи.")
+        return
+    user_data[m.from_user.id]["product"] = text.lower()
     user_states[m.from_user.id] = "WAIT_PRICE"
     await m.answer(
-        f"✅ Принято: {m.text}\n\n💰 Шаг 2/4: Какая цена?\nНапиши только число (например: 89).",
-        parse_mode="Markdown"
+        f"✅ Принято: {text}\n\n💰 *Шаг 2/4: Какая цена?*\nНапиши только число (например: 89).",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb()
     )
 
 @dp.message(lambda msg: user_states.get(msg.from_user.id) == "WAIT_PRICE")
@@ -133,36 +154,48 @@ async def get_price(m: types.Message):
         user_states[m.from_user.id] = "WAIT_STORE"
         await m.answer(
             f"✅ Цена: {int(price)} ₽\n\n🏪 *Шаг 3/4: Какой магазин?*\nНапиши название (Пятёрочка, Магнит).",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=cancel_kb()
         )
     except ValueError:
         await m.answer("❌ Это не число. Попробуй ещё раз (только цифры).")
 
 @dp.message(lambda msg: user_states.get(msg.from_user.id) == "WAIT_STORE")
 async def get_store(m: types.Message):
-    user_data[m.from_user.id]["store"] = m.text.strip()
+    text = m.text.strip()
+    if len(text) > MAX_LEN["store"]:
+        await m.answer(f"❌ Слишком длинное название магазина (макс. {MAX_LEN['store']} символов).")
+        return
+    user_data[m.from_user.id]["store"] = text
     user_states[m.from_user.id] = "WAIT_ADDRESS"
     await m.answer(
-        f"✅ Магазин: {m.text}\n\n📍 Шаг 4/4: Адрес или район?\nГде это находится? (ул. Ленина, Рынок).",
-        parse_mode="Markdown"
+        f"✅ Магазин: {text}\n\n📍 *Шаг 4/4: Адрес или район?*\nГде это находится? (ул. Ленина, Рынок).",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb()
     )
 
 @dp.message(lambda msg: user_states.get(msg.from_user.id) == "WAIT_ADDRESS")
 async def get_address(m: types.Message):
+    text = m.text.strip()
+    if len(text) > MAX_LEN["address"]:
+        await m.answer(f"❌ Слишком длинный адрес (макс. {MAX_LEN['address']} символов).")
+        return
     data = user_data[m.from_user.id]
-    address = m.text.strip()
-    c = conn.cursor()
-    c.execute("""INSERT OR REPLACE INTO prices (product, store, address, price, updated_at)
-                VALUES (?, ?, ?, ?, datetime('now'))""",
-              (data["product"], data["store"], address, data["price"]))
-    conn.commit()
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            """INSERT OR REPLACE INTO prices (product, store, address, price, updated_at)
+               VALUES (?, ?, ?, ?, datetime('now', '+3 hours'))""",
+            (data["product"], data["store"], text, data["price"])
+        )
+        conn.commit()
     user_last_add[m.from_user.id] = time.time()
     reset_user(m.from_user.id)
     await m.answer(
         f"✅ *Готово! Джазакя Аллаху хайран!*\n\n"
         f"📦 {data['product'].title()}: {int(data['price'])} ₽\n"
         f"🏪 {data['store']}\n"
-        f"📍 {address}",
+        f"📍 {text}",
         parse_mode="Markdown",
         reply_markup=main_menu()
     )
@@ -187,7 +220,7 @@ async def ask_basket(m: types.Message):
 @dp.message(F.text)
 async def handle_text(m: types.Message):
     if m.from_user.id in user_states:
-        await m.answer("⏳ Сейчас мы добавляем цену. Чтобы отменить, нажми 'Назад'.")
+        await m.answer("⏳ Сейчас мы добавляем цену. Чтобы отменить, нажми ❌ в сообщении выше.")
         return
     text = m.text.lower().strip()
     if "," in text:
@@ -203,65 +236,95 @@ async def handle_voice(m: types.Message):
         reply_markup=main_menu()
     )
 
-async def search_single_item(m: types.Message, product_name):
-    c = conn.cursor()
-    c.execute("SELECT product, store, address, price, updated_at FROM prices WHERE LOWER(product) LIKE ? ORDER BY price ASC",
-              (f"%{product_name}%",))
-    rows = c.fetchall()
+# --- ФУНКЦИИ ПОИСКА ---
+async def search_single_item(m: types.Message, product_name: str):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT product, store, address, price, updated_at FROM prices "
+            "WHERE LOWER(product) LIKE ? ORDER BY price ASC",
+            (f"%{product_name}%",)
+        )
+        rows = c.fetchall()
+
     if not rows:
-        await m.answer(f"😔 По товару «{product_name}» пока нет данных.\nТы можешь добавить цену! Нажми ➕ Добавить цену",
-                       reply_markup=main_menu())
+        await m.answer(
+            f"😔 По товару «{product_name}» пока нет данных.\n"
+            "Ты можешь добавить цену! Нажми ➕ Добавить цену",
+            reply_markup=main_menu()
+        )
         return
-    reply = f"🔍 *Результаты по запросу «{product_name.title()}»:* \n\n"
+
+    reply = f"🔍 *Результаты по запросу «{product_name.title()}»:*\n\n"
     for i, (prod_name, store, addr, price, updated) in enumerate(rows[:5], 1):
-        reply += f"{i}. 🏪 *{store}*\n"
-        reply += f"   📦 {prod_name.title()}\n"
-        reply += f"   📍 {addr}\n"
-        reply += f"   💰 {int(price)} ₽\n"
-        reply += f"   📅 {updated.split(' ')[0]}\n\n"
+        date_str = updated.split(" ")[0] if updated else "—"
+        reply += (
+            f"{i}. 🏪 *{store}*\n"
+            f"   📦 {prod_name.title()}\n"
+            f"   📍 {addr}\n"
+            f"   💰 {int(price)} ₽\n"
+            f"   📅 {date_str}\n\n"
+        )
     reply += "💡 Цены добавляют пользователи. Проверяйте на кассе."
     await m.answer(reply, parse_mode="Markdown", reply_markup=main_menu())
 
-async def search_basket(m: types.Message, items):
-    c = conn.cursor()
-    stores = {}
-    for item in items:
-        c.execute("SELECT product, store, address, price FROM prices WHERE LOWER(product) LIKE ?", (f"%{item}%",))
-        for prod_name, store, addr, price in c.fetchall():
-            if store not in stores:
-                stores[store] = {"addr": addr, "total": 0, "items": {}, "count": 0, "products_found": set()}
-            if item not in stores[store]["products_found"]:
-                stores[store]["products_found"].add(item)
-                stores[store]["items"][item] = int(price)
-                stores[store]["total"] += int(price)
-                stores[store]["count"] += 1
-    valid = [(n, d) for n, d in stores.items() if d["count"] >= 1]
-    valid.sort(key=lambda x: (-x[1]["count"], x[1]["total"]))
+async def search_basket(m: types.Message, items: list):
+    with get_db() as conn:
+        c = conn.cursor()
+        stores = {}
+        for item in items:
+            c.execute(
+                "SELECT product, store, address, price FROM prices WHERE LOWER(product) LIKE ?",
+                (f"%{item}%",)
+            )
+            for prod_name, store, addr, price in c.fetchall():
+                if store not in stores:
+                    stores[store] = {"addr": addr, "total": 0, "items": {}, "count": 0, "products_found": set()}
+                if item not in stores[store]["products_found"]:
+                    stores[store]["products_found"].add(item)
+                    stores[store]["items"][item] = int(price)
+                    stores[store]["total"] += int(price)
+                    stores[store]["count"] += 1
+
+    valid = sorted(
+        [(n, d) for n, d in stores.items() if d["count"] >= 1],
+        key=lambda x: (-x[1]["count"], x[1]["total"])
+    )
+
     if not valid:
         await m.answer("😔 Пока нет данных по этому списку. Попробуй добавить товары.", reply_markup=main_menu())
         return
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]  # исправлено 4️⃣
     reply = f"🛒 *Твой список:* {', '.join(items).title()}\n\n"
     for i, (store, data) in enumerate(valid[:5], 1):
-        medal = ["🥇", "🥈", "", "4️", "5️⃣"][i-1] if i <= 5 else f"{i}."
+        medal = medals[i - 1] if i <= len(medals) else f"{i}."
         found_count = data["count"]
         total_count = len(items)
-        reply += f"{medal} *{store}* ({data['addr']})\n"
-        reply += f"   📦 Найдено: {found_count} из {total_count} товаров\n"
-        reply += f"   💰 Общая сумма: {data['total']} ₽\n"
+        reply += (
+            f"{medal} *{store}* ({data['addr']})\n"
+            f"   📦 Найдено: {found_count} из {total_count} товаров\n"
+            f"   💰 Общая сумма: {data['total']} ₽\n"
+        )
         for prod, pr in data["items"].items():
             reply += f"   • {prod.title()}: {pr} ₽\n"
         missing = [it for it in items if it not in data["items"]]
         if missing:
             reply += f"   ⚠️ Нет: {', '.join(missing).title()}\n"
         reply += "\n"
+
     full_stores = [(n, d) for n, d in valid if d["count"] == len(items)]
     if full_stores:
         best = full_stores[0]
-        reply += f"✅ *Совет:* Все товары есть в *{best[0]}* за {best[1]['total']} ₽ — это самый выгодный вариант!"
+        reply += f"✅ *Совет:* Все товары есть в *{best[0]}* за {best[1]['total']} ₽ — самый выгодный вариант!"
     else:
         best_partial = valid[0]
-        reply += f"⚠️ *Ни в одном магазине нет всего списка.*\n"
-        reply += f"💡 Лучше всего: *{best_partial[0]}* ({best_partial[1]['count']} из {len(items)} товаров) за {best_partial[1]['total']} ₽"
+        reply += (
+            f"⚠️ *Ни в одном магазине нет всего списка.*\n"
+            f"💡 Лучше всего: *{best_partial[0]}* ({best_partial[1]['count']} из {len(items)} товаров) "
+            f"за {best_partial[1]['total']} ₽"
+        )
+
     await m.answer(reply, parse_mode="Markdown", reply_markup=main_menu())
 
 async def main():
