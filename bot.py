@@ -39,8 +39,10 @@ user_last_add = {}
 
 
 def reset_user(user_id):
-    if user_id in user_states: del user_states[user_id]
-    if user_id in user_data: del user_data[user_id]
+    if user_id in user_states:
+        del user_states[user_id]
+    if user_id in user_data:
+        del user_data[user_id]
 
 
 # --- КЛАВИАТУРЫ ---
@@ -53,7 +55,6 @@ def main_menu():
 
 
 def popular_products_kb():
-    # Убрал лишние пробелы, чтобы split работал стабильно
     products = ["🥛 Молоко", "🍞 Хлеб", "🍗 Курица", "🥩 Говядина", "🍚 Рис", "🥚 Яйца", "🧈 Масло", "🍯 Финики"]
     kb = [products[i:i + 2] for i in range(0, len(products), 2)]
     kb.append([KeyboardButton(text="⬅️ Назад в меню")])
@@ -61,7 +62,6 @@ def popular_products_kb():
 
 
 # --- ХЕНДЛЕРЫ ---
-
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
     reset_user(m.from_user.id)
@@ -97,7 +97,6 @@ async def cmd_back(m: types.Message):
 async def start_add_price(m: types.Message):
     user_id = m.from_user.id
 
-    # Проверка на спам (60 секунд между добавлениями)
     if user_id in user_last_add:
         time_passed = time.time() - user_last_add[user_id]
         if time_passed < 60:
@@ -108,12 +107,7 @@ async def start_add_price(m: types.Message):
     user_states[user_id] = "WAIT_PRODUCT"
     user_data[user_id] = {}
     await m.answer(
-        "📝 *Шаг 1/4: Какой товар?*\n"
-        "Напиши название. Для порядка укажи объем/вес/процент:\n"
-        "• молоко 1л 3.2%\n"
-        "• хлеб белый 500г\n"
-        "• яйца 10шт\n\n"
-        "Так поиск будет точнее! 👇",
+        "📝 *Шаг 1/4: Какой товар?*\nНапиши название (например: молоко, хлеб).",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_add")]])
@@ -142,7 +136,6 @@ async def get_price(m: types.Message):
     try:
         price = float(m.text.replace(",", "."))
 
-        # Проверка на адекватность цены
         if price < 1 or price > 50000:
             await m.answer("❌ Цена выглядит неверной (меньше 1₽ или больше 50 000₽). Проверь и напиши снова.")
             return
@@ -233,10 +226,8 @@ async def handle_voice(m: types.Message):
     )
 
 
-# ✅ ИСПРАВЛЕННАЯ ФУНКЦИЯ ПОИСКА (теперь показывает точное название товара)
 async def search_single_item(m: types.Message, product_name):
     c = conn.cursor()
-    # Добавили product в выборку
     c.execute(
         "SELECT product, store, address, price, updated_at FROM prices WHERE LOWER(product) LIKE ? ORDER BY price ASC",
         (f"%{product_name}%",))
@@ -269,17 +260,13 @@ async def search_basket(m: types.Message, items):
             if store not in stores:
                 stores[store] = {"addr": addr, "total": 0, "items": {}, "count": 0, "products_found": set()}
 
-            # Проверяем, не добавляли ли уже этот товар (чтобы не дублировать)
             if item not in stores[store]["products_found"]:
                 stores[store]["products_found"].add(item)
                 stores[store]["items"][item] = int(price)
                 stores[store]["total"] += int(price)
                 stores[store]["count"] += 1
 
-    # Показываем только магазины, где есть ХОТЯ БЫ 1 товар
     valid = [(n, d) for n, d in stores.items() if d["count"] >= 1]
-
-    # Сортируем: сначала те, где больше товаров, потом по цене
     valid.sort(key=lambda x: (-x[1]["count"], x[1]["total"]))
 
     if not valid:
@@ -297,18 +284,14 @@ async def search_basket(m: types.Message, items):
         reply += f"   📦 Найдено: {found_count} из {total_count} товаров\n"
         reply += f"   💰 Общая сумма: {data['total']} ₽\n"
 
-        # Показываем какие товары есть
         for prod, pr in data["items"].items():
             reply += f"   • {prod.title()}: {pr} ₽\n"
 
-        # Показываем каких товаров НЕТ
         missing = [it for it in items if it not in data["items"]]
         if missing:
             reply += f"   ⚠️ Нет: {', '.join(missing).title()}\n"
-
         reply += "\n"
 
-    # Рекомендация: показываем только если есть магазин со ВСЕМИ товарами
     full_stores = [(n, d) for n, d in valid if d["count"] == len(items)]
     if full_stores:
         best = full_stores[0]
